@@ -1,4 +1,4 @@
-"""Post Devpost hackathon updates (open, upcoming, ended) to a Discord webhook."""
+"""Sync Devpost open/upcoming hackathons to Discord channels by prize tier."""
 
 from __future__ import annotations
 
@@ -12,34 +12,51 @@ import urllib.request
 from pathlib import Path
 
 DEVPOST_API = "https://devpost.com/api/hackathons"
-STATUSES = ("open", "upcoming", "ended")
-# Ended hackathons number in the thousands; only check recent pages.
-MAX_ENDED_PAGES = 3
-STATE_FILE = Path(__file__).resolve().parent / "state.json"
+STATUSES = ("open", "upcoming")
+ROOT = Path(__file__).resolve().parent
+CHANNELS_FILE = ROOT / "channels.json"
+STATE_FILE = ROOT / "state.json"
 
 STATUS_COLORS = {
     "open": 0x57F287,
     "upcoming": 0xFEE75C,
-    "ended": 0xED4245,
 }
 
 STATUS_LABELS = {
     "open": "Open",
     "upcoming": "Upcoming",
-    "ended": "Closed",
 }
 
-USER_AGENT = "devpost-hackathon-notifier/1.0 (+https://github.com/devpost-hackathon-notifier)"
+USER_AGENT = "devpost-hackathon-notifier/2.0"
+POST_DELAY_SECONDS = 1.0
+API_PAGE_DELAY_SECONDS = 0.5
+
+
+def load_json(path: Path) -> dict:
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def load_state() -> dict:
     if STATE_FILE.exists():
-        return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-    return {"hackathons": {}}
+        return load_json(STATE_FILE)
+    return {"tiers": {}}
 
 
 def save_state(state: dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+
+
+def load_tier_config() -> list[dict]:
+    config = load_json(CHANNELS_FILE)
+    return config["tiers"]
+
+
+def webhook_for_tier(tier: dict) -> str:
+    env_name = tier["webhook_env"]
+    url = os.environ.get(env_name, "").strip()
+    if not url:
+        raise RuntimeError(f"Missing environment variable: {env_name}")
+    return url
 
 
 def fetch_page(status: str, page: int) -> list[dict]:
@@ -50,30 +67,61 @@ def fetch_page(status: str, page: int) -> list[dict]:
     return payload.get("hackathons", [])
 
 
-def fetch_all_for_status(status: str) -> list[dict]:
+def fetch_all_hackathons() -> list[dict]:
     hackathons: list[dict] = []
-    page = 1
-    max_pages = MAX_ENDED_PAGES if status == "ended" else None
+    seen_ids: set[int] = set()
 
-    while True:
-        batch = fetch_page(status, page)
-        if not batch:
-            break
-        hackathons.extend(batch)
-        if max_pages is not None and page >= max_pages:
-            break
-        page += 1
-        time.sleep(0.5)
+    for status in STATUSES:
+        page = 1
+        while True:
+            batch = fetch_page(status, page)
+            if not batch:
+                break
+            for hackathon in batch:
+                hackathon_id = hackathon["id"]
+                if hackathon_id not in seen_ids:
+                    seen_ids.add(hackathon_id)
+                    hackathons.append(hackathon)
+            page += 1
+            time.sleep(API_PAGE_DELAY_SECONDS)
 
     return hackathons
 
 
-def clean_prize_amount(raw: str | None) -> str:
+def parse_prize_amount(raw: str | None) -> int:
     if not raw:
-        return "N/A"
+        return 0
+
+    match = re.search(r"data-currency-value[^>]*>([\d,]+)", raw)
+    if match:
+        return int(match.group(1).replace(",", ""))
+
     text = re.sub(r"<[^>]+>", "", raw)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text or "N/A"
+    numbers = re.findall(r"[\d,]+", text)
+    if numbers:
+        return int(numbers[0].replace(",", ""))
+    return 0
+
+
+def classify_tier(prize: int) -> str:
+    if prize >= 100_000:
+        return "100k_plus"
+    if prize >= 10_000:
+        return "10k_100k"
+    if prize > 0:
+        return "under_10k"
+    return "free"
+
+
+def clean_prize_display(raw: str | None, prize: int) -> str:
+    if prize == 0:
+        return "Free / no cash prizes"
+    if raw:
+        text = re.sub(r"<[^>]+>", "", raw)
+        text = re.sub(r"\s+", " ", text).strip()
+        if text:
+            return text
+    return f"${prize:,}"
 
 
 def thumbnail_url(raw: str | None) -> str | None:
@@ -86,32 +134,32 @@ def thumbnail_url(raw: str | None) -> str | None:
     return None
 
 
-def should_notify(hackathon: dict, state: dict) -> bool:
-    hackathon_id = str(hackathon["id"])
-    current_status = hackathon["open_state"]
-    known = state["hackathons"].get(hackathon_id)
-
-    if known is None:
-        return True
-
-    return known.get("status") != current_status
-
-
-def record_hackathon(hackathon: dict, state: dict) -> None:
-    hackathon_id = str(hackathon["id"])
-    state["hackathons"][hackathon_id] = {
-        "status": hackathon["open_state"],
-        "title": hackathon.get("title", ""),
-        "url": hackathon.get("url", ""),
+def bucket_hackathons(hackathons: list[dict]) -> dict[str, list[dict]]:
+    buckets: dict[str, list[dict]] = {
+        "100k_plus": [],
+        "10k_100k": [],
+        "under_10k": [],
+        "free": [],
     }
 
+    for hackathon in hackathons:
+        prize = parse_prize_amount(hackathon.get("prize_amount"))
+        hackathon["_prize_value"] = prize
+        tier_id = classify_tier(prize)
+        buckets[tier_id].append(hackathon)
 
-def build_embed(hackathon: dict) -> dict:
+    for tier_id in buckets:
+        buckets[tier_id].sort(key=lambda item: item["_prize_value"], reverse=True)
+
+    return buckets
+
+
+def build_embed(hackathon: dict, tier_label: str, rank: int) -> dict:
     status = hackathon["open_state"]
     status_label = STATUS_LABELS.get(status, status.title())
     location = hackathon.get("displayed_location", {}).get("location", "N/A")
     themes = ", ".join(theme["name"] for theme in hackathon.get("themes", [])[:4]) or "N/A"
-    prize = clean_prize_amount(hackathon.get("prize_amount"))
+    prize = clean_prize_display(hackathon.get("prize_amount"), hackathon["_prize_value"])
     organization = hackathon.get("organization_name") or "N/A"
 
     embed: dict = {
@@ -119,6 +167,8 @@ def build_embed(hackathon: dict) -> dict:
         "url": hackathon["url"],
         "color": STATUS_COLORS.get(status, 0x5865F2),
         "description": (
+            f"**Tier:** {tier_label}\n"
+            f"**Rank:** #{rank} by prize\n"
             f"**Status:** {status_label}\n"
             f"**Host:** {organization}\n"
             f"**Prizes:** {prize}"
@@ -145,7 +195,7 @@ def build_embed(hackathon: dict) -> dict:
                 "inline": False,
             },
         ],
-        "footer": {"text": "Devpost Hackathon Notifier"},
+        "footer": {"text": "Devpost Hackathon Notifier • Updated daily"},
     }
 
     thumb = thumbnail_url(hackathon.get("thumbnail_url"))
@@ -155,67 +205,105 @@ def build_embed(hackathon: dict) -> dict:
     return embed
 
 
-def post_to_discord(webhook_url: str, embed: dict) -> None:
-    payload = json.dumps({"embeds": [embed]}).encode("utf-8")
+def discord_request(
+    webhook_url: str,
+    method: str,
+    payload: dict | None = None,
+) -> dict | None:
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    headers = {"User-Agent": USER_AGENT}
+    if payload is not None:
+        headers["Content-Type"] = "application/json"
+
     request = urllib.request.Request(
         webhook_url,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": USER_AGENT,
-        },
-        method="POST",
+        data=data,
+        headers=headers,
+        method=method,
     )
-    with urllib.request.urlopen(request, timeout=30) as response:
-        if response.status >= 400:
-            raise urllib.error.HTTPError(
-                request.full_url,
-                response.status,
-                response.reason,
-                response.headers,
-                None,
-            )
+
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            body = response.read().decode("utf-8")
+            if not body:
+                return None
+            return json.loads(body)
+    except urllib.error.HTTPError as error:
+        if error.code == 429:
+            retry_after = error.headers.get("Retry-After", "2")
+            time.sleep(float(retry_after))
+            return discord_request(webhook_url, method, payload)
+        if error.code == 404 and method == "DELETE":
+            return None
+        raise
 
 
-def seed_state(state: dict) -> int:
-    count = 0
-    for status in STATUSES:
-        for hackathon in fetch_all_for_status(status):
-            record_hackathon(hackathon, state)
-            count += 1
-    return count
+def post_embed(webhook_url: str, embed: dict) -> str:
+    response = discord_request(webhook_url, "POST", {"embeds": [embed]})
+    if not response or "id" not in response:
+        raise RuntimeError("Discord did not return a message id")
+    return response["id"]
+
+
+def delete_message(webhook_url: str, message_id: str) -> None:
+    url = f"{webhook_url.rstrip('/')}/messages/{message_id}"
+    discord_request(url, "DELETE")
+
+
+def sync_tier(
+    tier: dict,
+    hackathons: list[dict],
+    state: dict,
+) -> int:
+    tier_id = tier["id"]
+    webhook_url = webhook_for_tier(tier)
+    tier_state = state["tiers"].setdefault(tier_id, {"message_ids": []})
+    old_message_ids = list(tier_state.get("message_ids", []))
+
+    for message_id in old_message_ids:
+        delete_message(webhook_url, message_id)
+        time.sleep(POST_DELAY_SECONDS)
+
+    new_message_ids: list[str] = []
+    for index, hackathon in enumerate(hackathons, start=1):
+        embed = build_embed(hackathon, tier["label"], index)
+        message_id = post_embed(webhook_url, embed)
+        new_message_ids.append(message_id)
+        print(f"  Posted #{index}: [{hackathon['open_state']}] {hackathon['title']}")
+        time.sleep(POST_DELAY_SECONDS)
+
+    tier_state["message_ids"] = new_message_ids
+    tier_state["count"] = len(new_message_ids)
+    tier_state["last_synced"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    return len(new_message_ids)
 
 
 def run() -> int:
-    state = load_state()
-    is_first_run = not state["hackathons"]
-    post_existing = os.environ.get("POST_EXISTING", "").lower() in ("1", "true", "yes")
-
-    if is_first_run and not post_existing:
-        seeded = seed_state(state)
-        save_state(state)
-        print(f"First run: seeded {seeded} hackathons without posting.")
-        print("Re-run with POST_EXISTING=1 to post current hackathons to Discord.")
-        return 0
-
-    webhook_url = os.environ.get("DISCORD_WEBHOOK_URL", "").strip()
-    if not webhook_url:
-        print("DISCORD_WEBHOOK_URL is not set.", file=sys.stderr)
+    tiers = load_tier_config()
+    missing = [
+        tier["webhook_env"]
+        for tier in tiers
+        if not os.environ.get(tier["webhook_env"], "").strip()
+    ]
+    if missing:
+        print("Missing webhook environment variables:", ", ".join(missing), file=sys.stderr)
         return 1
 
-    posted = 0
-    for status in STATUSES:
-        for hackathon in fetch_all_for_status(status):
-            if should_notify(hackathon, state):
-                embed = build_embed(hackathon)
-                post_to_discord(webhook_url, embed)
-                posted += 1
-                print(f"Posted: [{hackathon['open_state']}] {hackathon['title']}")
-                time.sleep(1.0)
-            record_hackathon(hackathon, state)
+    print("Fetching open and upcoming hackathons from Devpost...")
+    hackathons = fetch_all_hackathons()
+    buckets = bucket_hackathons(hackathons)
+    state = load_state()
+    state.setdefault("tiers", {})
+
+    total_posted = 0
+    print(f"Found {len(hackathons)} hackathon(s). Syncing Discord channels...")
+    for tier in tiers:
+        tier_hackathons = buckets.get(tier["id"], [])
+        print(f"\n{tier['label']} ({len(tier_hackathons)} hackathon(s))")
+        total_posted += sync_tier(tier, tier_hackathons, state)
 
     save_state(state)
-    print(f"Done. Posted {posted} update(s). Tracking {len(state['hackathons'])} hackathon(s).")
+    print(f"\nDone. Posted {total_posted} message(s) across {len(tiers)} channel(s).")
     return 0
 
 

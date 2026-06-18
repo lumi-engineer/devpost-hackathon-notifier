@@ -1,0 +1,24 @@
+{
+  "tiers": [
+    {
+      "id": "100k_plus",
+      "label": "A - $100k+",
+      "webhook_env": "WEBHOOK_100K_PLUS"
+    },
+    {
+      "id": "10k_100k",
+      "label": "B - $10k–$100k",
+      "webhook_env": "WEBHOOK_10K_100K"
+    },
+    {
+      "id": "under_10k",
+      "label": "C - Under $10k",
+      "webhook_env": "WEBHOOK_UNDER_10K"
+    },
+    {
+      "id": "free",
+      "label": "D - Free",
+      "webhook_env": "WEBHOOK_FREE"
+    }
+  ]
+}

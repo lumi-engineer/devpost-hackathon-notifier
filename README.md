@@ -1,166 +1,136 @@
 # Devpost Hackathon Notifier
 
-Posts new and updated [Devpost](https://devpost.com) hackathons (Open, Upcoming, Closed) to your Discord server via webhooks. Runs free on GitHub Actions — no server, no Discord bot token, and no paid hosting required.
+Syncs **Open** and **Upcoming** [Devpost](https://devpost.com) hackathons to Discord channels sorted by prize tier. Runs once daily on GitHub Actions — delete old posts and repost fresh sorted embeds each run.
 
 ## What it does
 
-1. **Fetches hackathons** from Devpost's public JSON API:
-   - **Open** — accepting submissions now
-   - **Upcoming** — not started yet
-   - **Closed** — recently ended (last 3 pages only)
-
-2. **Sends rich Discord embeds** with title, link, status, host, prizes, dates, location, time left, themes, and thumbnail.
-
-3. **Avoids duplicate posts** using `state.json` — only notifies on new hackathons or status changes (e.g. Upcoming → Open, Open → Closed).
-
-4. **Runs automatically** every 6 hours via GitHub Actions, or manually on your PC.
+1. Fetches all **Open** and **Upcoming** hackathons from Devpost.
+2. Parses prize amounts and assigns each hackathon to a tier:
+   - **A — $100k+**
+   - **B — $10k–$100k**
+   - **C — Under $10k**
+   - **D — Free** ($0)
+3. Sorts hackathons **highest prize first** within each tier.
+4. Posts **one embed per hackathon** to the matching Discord channel.
+5. On each daily run: **deletes previous bot messages** in each channel and **reposts** the full sorted list.
 
 ```
-GitHub Actions / python main.py
+Daily GitHub Action
         │
         ▼
-    main.py ──► Devpost API
-        │           │
-        ├── state.json (dedupe)
+    main.py ──► Devpost API (open + upcoming)
         │
-        └── Discord Webhook ──► #your-channel
+        ├── Sort by prize tier
+        │
+        ├── Delete old Discord messages (state.json)
+        │
+        └── Repost sorted embeds ──► 4 Discord channels
 ```
 
 ## Project structure
 
 | File | Purpose |
 |------|---------|
-| `main.py` | Core logic: fetch Devpost, decide what to post, send to Discord |
-| `state.json` | Tracks known hackathons so nothing is posted twice |
-| `.github/workflows/devpost-bot.yml` | Scheduled GitHub Actions workflow |
-| `.gitignore` | Excludes secrets and Python cache from git |
+| `main.py` | Fetch, sort, delete old posts, repost embeds |
+| `channels.json` | Prize tier definitions and webhook env var names |
+| `state.json` | Stores Discord message IDs per tier for cleanup |
+| `.env.example` | Template for local webhook URLs |
+| `.github/workflows/devpost-bot.yml` | Daily scheduled workflow |
 
-## Requirements
+## Discord setup
 
-- Python 3.9+ (stdlib only — no `pip install` needed)
-- A Discord server with a webhook URL
-- (Optional) A GitHub repo for free automated scheduling
+Create **4 channels** and one webhook each:
 
-## Quick start (GitHub Actions — recommended)
+| Channel | Tier | GitHub secret |
+|---------|------|---------------|
+| A - level | $100k+ | `WEBHOOK_100K_PLUS` |
+| B - level | $10k–$100k | `WEBHOOK_10K_100K` |
+| C - level | Under $10k | `WEBHOOK_UNDER_10K` |
+| D - level | Free | `WEBHOOK_FREE` |
 
-### 1. Create a Discord webhook
+> **Never commit webhook URLs to git.** Use GitHub Secrets or a local `.env` file.
 
-1. In Discord, open the target channel.
-2. **Edit Channel** → **Integrations** → **Webhooks** → **New Webhook**.
-3. Copy the webhook URL.
+## GitHub Actions setup
 
-> **Keep this URL secret.** Anyone with it can post to your channel. Never commit it to git.
-
-### 2. Push this repo to GitHub
-
-```bash
-git init
-git add .
-git commit -m "Add Devpost hackathon notifier"
-git remote add origin https://github.com/YOUR_USER/devpost-hackathon-notifier.git
-git push -u origin main
-```
-
-### 3. Add the webhook as a GitHub secret
-
-1. Open your repo on GitHub.
-2. **Settings** → **Secrets and variables** → **Actions** → **New repository secret**.
-3. Name: `DISCORD_WEBHOOK_URL`
-4. Value: your Discord webhook URL.
-
-### 4. Run the workflow
-
-1. Go to the **Actions** tab.
-2. Select **Devpost to Discord**.
-3. Click **Run workflow**.
-
-**First run (default):** Seeds `state.json` with current hackathons — no Discord messages (avoids spamming ~200 posts).
-
-**To post all current hackathons once:** Run the workflow manually with **post_existing = true**.
-
-After setup, the bot runs automatically every **6 hours (UTC)** and commits updated `state.json` to the repo.
+1. Push this repo to GitHub.
+2. Add four repository secrets under **Settings → Secrets → Actions**:
+   - `WEBHOOK_100K_PLUS`
+   - `WEBHOOK_10K_100K`
+   - `WEBHOOK_UNDER_10K`
+   - `WEBHOOK_FREE`
+3. Enable **Actions** and run **Devpost to Discord** manually once to test.
+4. The workflow runs automatically **every day at 09:00 UTC**.
 
 ## Run locally
 
 ```bash
-cd devpost-hackathon-notifier
+# Copy template and fill in your webhook URLs
+cp .env.example .env
 
-# First run — seed state without posting to Discord
+# Linux / macOS — load .env then run
+set -a && source .env && set +a
 python main.py
 
-# Optional: post all current hackathons once
-# Linux / macOS:
-export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
-export POST_EXISTING=1
-python main.py
-
-# Windows (cmd):
-set DISCORD_WEBHOOK_URL=https://discord.com/api/webhooks/...
-set POST_EXISTING=1
-python main.py
-
-# Normal run — only new or changed hackathons
-export DISCORD_WEBHOOK_URL="https://discord.com/api/webhooks/..."
+# Windows (PowerShell)
+Get-Content .env | ForEach-Object {
+  if ($_ -match '^([^#=]+)=(.*)$') { Set-Item -Path "env:$($matches[1])" -Value $matches[2] }
+}
 python main.py
 ```
 
-## Environment variables
+Each run deletes previous messages in all four channels and reposts the current sorted list.
 
-| Variable | Required | Description |
-|----------|----------|-------------|
-| `DISCORD_WEBHOOK_URL` | Yes (when posting) | Discord webhook URL for your channel |
-| `POST_EXISTING` | No | Set to `1`, `true`, or `yes` to post all current hackathons instead of seed-only on first run |
+## How sorting works
 
-## How notifications work
+| Prize parsed | Tier | Channel |
+|--------------|------|---------|
+| ≥ $100,000 | `100k_plus` | A - level |
+| $10,000 – $99,999 | `10k_100k` | B - level |
+| $1 – $9,999 | `under_10k` | C - level |
+| $0 | `free` | D - level |
 
-### First run — seed mode
+Prizes are parsed from Devpost's `prize_amount` field. Non-USD values use the numeric amount for tier assignment.
 
-When `state.json` is empty and `POST_EXISTING` is not set, the bot records all current hackathons without posting. This prevents flooding your channel on day one.
+## Discord message format
 
-### Later runs
+Each hackathon gets one embed with:
 
-The bot posts to Discord when:
-
-- A **new hackathon** appears on Devpost
-- A **status changes** for a hackathon already in state (e.g. Open → Closed)
-
-It skips hackathons that are unchanged since the last run.
-
-### Discord message format
-
-Each notification is a rich embed:
-
-- **Title** — hackathon name (links to Devpost)
-- **Status** — Open (green), Upcoming (yellow), Closed (red)
-- **Host** and **prize pool**
-- **Dates**, **location**, **time left**, **themes**
-- **Thumbnail** — hackathon banner image
+- Title (linked to Devpost)
+- Tier, rank by prize, status (Open / Upcoming)
+- Host, prizes, dates, location, time left, themes
+- Thumbnail banner
 
 ## Schedule
 
-The default cron runs every 6 hours UTC:
+Default: **once per day at 09:00 UTC** (`0 9 * * *`).
 
-```yaml
-cron: "0 */6 * * *"
-```
+Edit `.github/workflows/devpost-bot.yml` to change the time.
 
-Edit `.github/workflows/devpost-bot.yml` to change the schedule. GitHub cron jobs may be delayed by 5–15 minutes.
+## Run duration
+
+| Step | Approximate time |
+|------|------------------|
+| Fetch Devpost data | ~1–2 minutes |
+| Delete + repost ~170 embeds | ~5–6 minutes |
+| **Total** | **~6–8 minutes** |
+
+The bot waits 1 second between Discord API calls to avoid rate limits.
 
 ## Important notes
 
-- **Unofficial API** — This uses the same JSON endpoint as the Devpost website (`https://devpost.com/api/hackathons`). It is not an official Devpost API and may change.
-- **Closed hackathons** — Only the 3 most recent pages of closed events are checked (thousands exist in total). You still get alerts for recently closed hackathons.
-- **Rate limits** — The bot waits 1 second between Discord posts and 0.5 seconds between Devpost API pages.
-- **Webhook security** — If your webhook URL is ever exposed, regenerate it in Discord immediately.
-- **GitHub Actions** — Repos with no activity for 60 days may pause scheduled workflows. A small commit re-enables them.
+- **Full refresh daily** — old messages are deleted and replaced, not edited in place.
+- **Open + Upcoming only** — closed/ended hackathons are not included.
+- **No region filtering** — all locations appear in the price tier channels.
+- **Unofficial API** — uses `https://devpost.com/api/hackathons` (same as the Devpost website).
+- **Webhook security** — regenerate webhooks if URLs are ever exposed publicly.
 
 ## Cost
 
 | Service | Cost |
 |---------|------|
 | Discord webhooks | Free |
-| GitHub Actions (public repo) | Free |
-| Devpost API | Free (no key required) |
+| GitHub Actions | Free tier sufficient |
+| Devpost API | Free |
 
 ## License
 
