@@ -7,7 +7,7 @@
     },
     {
       "id": "10k_100k",
-      "label": "B - $10k–$100k",
+      "label": "B - $10k-$100k",
       "webhook_env": "WEBHOOK_10K_100K"
     },
     {

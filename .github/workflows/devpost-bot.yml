@@ -12,6 +12,7 @@ permissions:
 jobs:
   notify:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,6 +21,22 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+
+      - name: Verify webhook secrets
+        env:
+          WEBHOOK_100K_PLUS: ${{ secrets.WEBHOOK_100K_PLUS }}
+          WEBHOOK_10K_100K: ${{ secrets.WEBHOOK_10K_100K }}
+          WEBHOOK_UNDER_10K: ${{ secrets.WEBHOOK_UNDER_10K }}
+          WEBHOOK_FREE: ${{ secrets.WEBHOOK_FREE }}
+        run: |
+          missing=0
+          for name in WEBHOOK_100K_PLUS WEBHOOK_10K_100K WEBHOOK_UNDER_10K WEBHOOK_FREE; do
+            if [ -z "${!name}" ]; then
+              echo "::error title=Missing secret::Add $name in Settings > Secrets and variables > Actions"
+              missing=1
+            fi
+          done
+          exit $missing
 
       - name: Sync hackathons to Discord
         env:

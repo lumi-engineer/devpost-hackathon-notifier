@@ -113,6 +113,11 @@ def classify_tier(prize: int) -> str:
     return "free"
 
 
+def embed_text(value: str | None, fallback: str = "N/A") -> str:
+    text = (value or "").strip()
+    return text[:1024] if text else fallback
+
+
 def clean_prize_display(raw: str | None, prize: int) -> str:
     if prize == 0:
         return "Free / no cash prizes"
@@ -157,8 +162,8 @@ def bucket_hackathons(hackathons: list[dict]) -> dict[str, list[dict]]:
 def build_embed(hackathon: dict, tier_label: str, rank: int) -> dict:
     status = hackathon["open_state"]
     status_label = STATUS_LABELS.get(status, status.title())
-    location = hackathon.get("displayed_location", {}).get("location", "N/A")
-    themes = ", ".join(theme["name"] for theme in hackathon.get("themes", [])[:4]) or "N/A"
+    location = embed_text(hackathon.get("displayed_location", {}).get("location"))
+    themes = embed_text(", ".join(theme["name"] for theme in hackathon.get("themes", [])[:4]))
     prize = clean_prize_display(hackathon.get("prize_amount"), hackathon["_prize_value"])
     organization = hackathon.get("organization_name") or "N/A"
 
@@ -176,22 +181,22 @@ def build_embed(hackathon: dict, tier_label: str, rank: int) -> dict:
         "fields": [
             {
                 "name": "Dates",
-                "value": hackathon.get("submission_period_dates", "N/A")[:1024],
+                "value": embed_text(hackathon.get("submission_period_dates")),
                 "inline": True,
             },
             {
                 "name": "Location",
-                "value": location[:1024],
+                "value": location,
                 "inline": True,
             },
             {
                 "name": "Time left",
-                "value": hackathon.get("time_left_to_submission", "N/A")[:1024],
+                "value": embed_text(hackathon.get("time_left_to_submission")),
                 "inline": True,
             },
             {
                 "name": "Themes",
-                "value": themes[:1024],
+                "value": themes,
                 "inline": False,
             },
         ],
@@ -235,19 +240,66 @@ def discord_request(
             return discord_request(webhook_url, method, payload)
         if error.code == 404 and method == "DELETE":
             return None
-        raise
+        body = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Discord API error {error.code} for {method}: {body or error.reason}"
+        ) from error
+    except urllib.error.URLError as error:
+        raise RuntimeError(f"Network error for {method}: {error.reason}") from error
+
+
+def webhook_with_wait(webhook_url: str) -> str:
+    separator = "&" if "?" in webhook_url else "?"
+    if "wait=" in webhook_url:
+        return webhook_url
+    return f"{webhook_url}{separator}wait=true"
 
 
 def post_embed(webhook_url: str, embed: dict) -> str:
-    response = discord_request(webhook_url, "POST", {"embeds": [embed]})
+    response = discord_request(
+        webhook_with_wait(webhook_url),
+        "POST",
+        {"embeds": [embed]},
+    )
     if not response or "id" not in response:
-        raise RuntimeError("Discord did not return a message id")
+        raise RuntimeError("Discord did not return a message id (expected response with ?wait=true)")
     return response["id"]
 
 
 def delete_message(webhook_url: str, message_id: str) -> None:
     url = f"{webhook_url.rstrip('/')}/messages/{message_id}"
     discord_request(url, "DELETE")
+
+
+def validate_webhook(env_name: str, webhook_url: str) -> None:
+    request = urllib.request.Request(
+        webhook_url,
+        headers={"User-Agent": USER_AGENT},
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Invalid webhook for {env_name} (HTTP {error.code}): {body or error.reason}"
+        ) from error
+    except urllib.error.URLError as error:
+        raise RuntimeError(
+            f"Could not reach webhook for {env_name}: {error.reason}"
+        ) from error
+
+
+def validate_webhooks(tiers: list[dict]) -> None:
+    print("Validating Discord webhooks...")
+    for tier in tiers:
+        env_name = tier["webhook_env"]
+        webhook_url = os.environ.get(env_name, "").strip()
+        if not webhook_url:
+            raise RuntimeError(f"Missing environment variable: {env_name}")
+        validate_webhook(env_name, webhook_url)
+        print(f"  OK: {tier['label']} ({env_name})")
 
 
 def sync_tier(
@@ -279,32 +331,29 @@ def sync_tier(
 
 
 def run() -> int:
-    tiers = load_tier_config()
-    missing = [
-        tier["webhook_env"]
-        for tier in tiers
-        if not os.environ.get(tier["webhook_env"], "").strip()
-    ]
-    if missing:
-        print("Missing webhook environment variables:", ", ".join(missing), file=sys.stderr)
+    try:
+        tiers = load_tier_config()
+        validate_webhooks(tiers)
+
+        print("Fetching open and upcoming hackathons from Devpost...")
+        hackathons = fetch_all_hackathons()
+        buckets = bucket_hackathons(hackathons)
+        state = load_state()
+        state.setdefault("tiers", {})
+
+        total_posted = 0
+        print(f"Found {len(hackathons)} hackathon(s). Syncing Discord channels...")
+        for tier in tiers:
+            tier_hackathons = buckets.get(tier["id"], [])
+            print(f"\n{tier['label']} ({len(tier_hackathons)} hackathon(s))")
+            total_posted += sync_tier(tier, tier_hackathons, state)
+
+        save_state(state)
+        print(f"\nDone. Posted {total_posted} message(s) across {len(tiers)} channel(s).")
+        return 0
+    except Exception as error:
+        print(f"ERROR: {error}", file=sys.stderr)
         return 1
-
-    print("Fetching open and upcoming hackathons from Devpost...")
-    hackathons = fetch_all_hackathons()
-    buckets = bucket_hackathons(hackathons)
-    state = load_state()
-    state.setdefault("tiers", {})
-
-    total_posted = 0
-    print(f"Found {len(hackathons)} hackathon(s). Syncing Discord channels...")
-    for tier in tiers:
-        tier_hackathons = buckets.get(tier["id"], [])
-        print(f"\n{tier['label']} ({len(tier_hackathons)} hackathon(s))")
-        total_posted += sync_tier(tier, tier_hackathons, state)
-
-    save_state(state)
-    print(f"\nDone. Posted {total_posted} message(s) across {len(tiers)} channel(s).")
-    return 0
 
 
 if __name__ == "__main__":
